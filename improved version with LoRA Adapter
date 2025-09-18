@@ -1,0 +1,276 @@
+import os, random, numpy as np, librosa, torch, copy, hashlib
+from torch.utils.data import Dataset
+from sklearn.metrics import accuracy_score
+from transformers import (
+    Wav2Vec2Processor, Wav2Vec2ForCTC, TrainingArguments, Trainer, EarlyStoppingCallback
+)
+from peft import LoraConfig, get_peft_model
+from deap import base, creator, tools
+import matplotlib.pyplot as plt
+
+# -------------------------------
+# Device setup (GPU)
+# -------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------------------------------
+# Audio & transcripts
+# -------------------------------
+audio_paths = [
+    r"C:\Users\ANKIT SINGH\Documents\recording_1_20250412_193115.wav",
+    r"C:\Users\ANKIT SINGH\Documents\recording_2_20250412_193119.wav",
+    r"C:\Users\ANKIT SINGH\Documents\recording_3_20250412_193124.wav"
+]
+transcripts = ["hello world", "hello noisy", "good morning"]
+
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+base_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h").to(device)
+base_model.eval()
+
+# -------------------------------
+# Dataset class
+# -------------------------------
+class AudioDataset(Dataset):
+    def __init__(self, audio_paths, transcripts, processor):
+        self.audio_paths = audio_paths
+        self.transcripts = transcripts
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.audio_paths)
+
+    def __getitem__(self, idx):
+        y, sr = librosa.load(self.audio_paths[idx], sr=16000)
+        input_values = self.processor(y, sampling_rate=16000,
+                                      return_tensors="pt").input_values.squeeze()
+        with self.processor.as_target_processor():
+            labels = self.processor(self.transcripts[idx],
+                                    return_tensors="pt").input_ids.squeeze()
+        return {"input_values": input_values, "labels": labels}
+
+# -------------------------------
+# Train / Validation / Test split
+# -------------------------------
+train_audio = audio_paths[:2]
+train_texts = transcripts[:2]
+val_audio = audio_paths[1:2]
+val_texts = transcripts[1:2]
+test_audio = audio_paths[2:]
+test_texts = transcripts[2:]
+
+train_dataset = AudioDataset(train_audio, train_texts, processor)
+val_dataset = AudioDataset(val_audio, val_texts, processor)
+test_dataset = AudioDataset(test_audio, test_texts, processor)
+
+# -------------------------------
+# LoRA model cache folder
+# -------------------------------
+LORA_CACHE_DIR = "./lora_cache"
+os.makedirs(LORA_CACHE_DIR, exist_ok=True)
+
+def individual_key(ind):
+    """Generate unique key for an individual's genome."""
+    genome_str = "_".join([f"{x:.4f}" for x in ind])
+    return hashlib.md5(genome_str.encode()).hexdigest()
+
+# -------------------------------
+# Helper: fine-tune LoRA with caching
+# -------------------------------
+def fine_tune_lora_cached(ind, hparams, train_dataset, val_dataset):
+    key = individual_key(ind)
+    cache_path = os.path.join(LORA_CACHE_DIR, f"{key}_lora")
+    
+    if os.path.exists(cache_path):
+        print(f"🔄 Loading cached LoRA model for individual {key}")
+        model = get_peft_model(base_model, LoraConfig(
+            r=hparams['rank'],
+            lora_alpha=32,
+            lora_dropout=hparams['dropout'],
+            target_modules=["q_proj","v_proj"]
+        ))
+        model.load_state_dict(torch.load(os.path.join(cache_path, "pytorch_model.bin"), map_location=device))
+        return model.to(device)
+    
+    # Train if not cached
+    model = fine_tune_lora(hparams, train_dataset, val_dataset)
+    
+    # Save to cache
+    os.makedirs(cache_path, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(cache_path, "pytorch_model.bin"))
+    return model
+
+# -------------------------------
+# Original fine-tune LoRA function
+# -------------------------------
+def fine_tune_lora(hparams, train_dataset, val_dataset):
+    lora_cfg = LoraConfig(
+        r=hparams['rank'],
+        lora_alpha=32,
+        lora_dropout=hparams['dropout'],
+        target_modules=["q_proj","v_proj"]
+    )
+    model = get_peft_model(base_model, lora_cfg).to(device)
+
+    args = TrainingArguments(
+        output_dir="./lora_out",
+        per_device_train_batch_size=hparams['batch_size'],
+        learning_rate=hparams['lr'],
+        max_steps=hparams['num_steps'],
+        weight_decay=hparams['weight_decay'],
+        logging_steps=10,
+        save_strategy="no",
+        report_to="none",
+        eval_strategy="steps",
+        eval_steps=10,
+        load_best_model_at_end=True
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=processor,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
+    )
+    trainer.train()
+    return model
+
+# -------------------------------
+# Evaluate ASR on TEST
+# -------------------------------
+def run_asr(model, audio_paths, hparams):
+    preds = []
+    model.eval()
+    for p in audio_paths:
+        y, sr = librosa.load(p, sr=16000)
+        y = y * hparams['audio_gain'] * hparams['noise_reduction_strength']
+        input_values = processor(y, sampling_rate=16000, return_tensors="pt").input_values.to(device)
+        with torch.no_grad():
+            logits = model(input_values).logits
+        thresh = torch.quantile(logits, hparams['logit_threshold'])
+        logits = torch.where(logits >= thresh, logits, torch.tensor(float('-inf'), device=device))
+        ids = torch.argmax(logits, dim=-1)
+        text = processor.decode(ids[0].cpu()).lower()
+        preds.append(text)
+    return preds
+
+# -------------------------------
+# Simulated latency & robustness
+# -------------------------------
+def simulate_latency(ind):
+    return sum(ind) * 100
+
+def test_noisy_audio(ind):
+    return random.uniform(0.5, 1.0)
+
+# -------------------------------
+# GA setup
+# -------------------------------
+creator.create("FitnessMulti", base.Fitness, weights=(-1.0, -1.0, 1.0))
+creator.create("Individual", list, fitness=creator.FitnessMulti)
+toolbox = base.Toolbox()
+toolbox.register("attr_float", random.random)
+toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, n=9)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+def evaluate(ind):
+    hparams = {
+        'rank': int(ind[0]*15)+1,
+        'lr': 1e-5 + ind[1]*5e-4,
+        'batch_size': int(ind[2]*28)+4,
+        'num_steps': int(ind[3]*450)+50,
+        'dropout': ind[4]*0.3,
+        'weight_decay': ind[5]*0.1,
+        'logit_threshold': ind[6],
+        'noise_reduction_strength': ind[7],
+        'audio_gain': 0.5 + ind[8]*1.5
+    }
+    # ✅ Train/eval using caching
+    model = fine_tune_lora_cached(ind, hparams, train_dataset, val_dataset)
+    # Evaluate on validation for GA fitness
+    preds_val = run_asr(model, val_audio, hparams)
+    wer_val = 1 - accuracy_score(val_texts, preds_val)
+    latency = simulate_latency(ind)
+    robustness = test_noisy_audio(ind)
+    return wer_val, latency, robustness, model
+
+toolbox.register("evaluate", evaluate)
+toolbox.register("mate", tools.cxBlend, alpha=0.5)
+def mutate_and_clip(ind):
+    tools.mutGaussian(ind, mu=0, sigma=0.2, indpb=0.1)
+    for i in range(len(ind)):
+        ind[i] = max(0, min(1, ind[i]))
+    return ind,
+toolbox.register("mutate", mutate_and_clip)
+toolbox.register("select", tools.selNSGA2)
+
+# -------------------------------
+# Run GA
+# -------------------------------
+def main():
+    pop = toolbox.population(n=6)
+    hof = tools.ParetoFront()
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean, axis=0)
+    stats.register("min", np.min, axis=0)
+
+    best_model = None
+    best_individual = None
+    best_wer = float('inf')
+
+    for gen in range(3):
+        print(f"\n=== Generation {gen+1} ===")
+        for ind in pop:
+            wer_val, latency, robustness, model = evaluate(ind)
+            ind.fitness.values = (wer_val, latency, robustness)
+            if wer_val < best_wer:
+                best_wer = wer_val
+                best_model = copy.deepcopy(model)
+                best_individual = copy.deepcopy(ind)
+            print(f"Individual {ind} -> Val WER: {wer_val:.4f}, Latency: {latency:.1f}, Robustness: {robustness:.3f}")
+
+        # Selection
+        pop = toolbox.select(pop, len(pop))
+        offspring = []
+        while len(offspring) < len(pop):
+            p1, p2 = random.sample(pop, 2)
+            child1, child2 = toolbox.mate(p1, p2)
+            toolbox.mutate(child1)
+            toolbox.mutate(child2)
+            offspring.extend([child1, child2])
+        pop = offspring[:len(pop)]
+
+    # ✅ Evaluate best individual on TEST
+    hparams_best = {
+        'rank': int(best_individual[0]*15)+1,
+        'lr': 1e-5 + best_individual[1]*5e-4,
+        'batch_size': int(best_individual[2]*28)+4,
+        'num_steps': int(best_individual[3]*450)+50,
+        'dropout': best_individual[4]*0.3,
+        'weight_decay': best_individual[5]*0.1,
+        'logit_threshold': best_individual[6],
+        'noise_reduction_strength': best_individual[7],
+        'audio_gain': 0.5 + best_individual[8]*1.5
+    }
+
+    preds_test = run_asr(best_model, test_audio, hparams_best)
+    test_wer = 1 - accuracy_score(test_texts, preds_test)
+
+    # Save best LoRA
+    best_model.save_pretrained("./best_lora_adapter")
+    print(f"\n✅ Best Individual: {best_individual} -> Val WER: {best_wer:.4f} -> Test WER: {test_wer:.4f}")
+
+    # Plot Pareto front
+    xs = [ind.fitness.values[1] for ind in hof]
+    ys = [ind.fitness.values[0] for ind in hof]
+    cs = [ind.fitness.values[2] for ind in hof]
+    plt.scatter(xs, ys, c=cs, cmap='viridis', s=60)
+    plt.xlabel("Latency")
+    plt.ylabel("Val WER")
+    plt.title("Pareto Front")
+    plt.colorbar(label="Robustness")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
